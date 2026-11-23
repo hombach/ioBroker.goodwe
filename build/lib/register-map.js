@@ -542,7 +542,10 @@ const registerGroups = {
             // The BMS limits the current further; 100 A matches Home Assistant.
             { scale: 10, unit: "A", writable: { min: 0, max: 1000 } }),
             entry(45354, "Settings.Battery.DischargeVoltage", "Battery.DischargeVoltage", TYPE.U16, { scale: 10, unit: "V" }),
-            entry(45355, "Settings.Battery.DischargeCurrent", "Battery.DischargeCurrent", TYPE.U16, { scale: 10, unit: "A" }),
+            entry(45355, "Settings.Battery.DischargeCurrent", "Battery.DischargeCurrent", TYPE.U16, 
+            // Same limit as the charge current. The inverter resets the value to
+            // its default after a reboot, so a script has to write it again.
+            { scale: 10, unit: "A", writable: { min: 0, max: 1000 } }),
             // 45356 and 45358 hold the reserve, 100 minus the depth of discharge the
             // SolarGo app shows (checked live: 95 % in the app, 5 in the register).
             // The range is in register units: a reserve of 5 to 100 % is a depth of
@@ -590,6 +593,8 @@ const registerGroups = {
     // 47000 and 47595-47597 are not in specification v1.7. Addresses and the work
     // mode values follow marcelblijleven/goodwe; a live GW10K-ET with ARM
     // firmware 29 answers both, older firmware may reject the load control.
+    // Only general and eco may be written: off-grid, backup and peak shaving
+    // change how the inverter treats the grid, so a typo must not get there.
     settingsWorkMode: {
         name: "Settings.WorkMode",
         start: 47000,
@@ -599,6 +604,7 @@ const registerGroups = {
         entries: [
             entry(47000, "Settings.WorkMode", "WorkMode", TYPE.U16, {
                 states: status_definitions_1.valueStates.workModeSetting,
+                writable: { min: 0, max: 3, values: [0, 3] },
             }),
         ],
     },

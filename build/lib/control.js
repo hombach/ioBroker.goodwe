@@ -68,6 +68,11 @@ function clampWriteValue(entry, value) {
     }
     const scaled = toRegisterUnits(entry, numeric);
     const register = Math.round(scaled);
+    if (range.values) {
+        return Number.isInteger(scaled) && range.values.includes(register)
+            ? register
+            : null;
+    }
     // An enum register accepts exactly the values it defines: rounding 4.4 into
     // mode 4 would guess, and clamping 99 would pick the highest mode instead.
     if (entry.states) {

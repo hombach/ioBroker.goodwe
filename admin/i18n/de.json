@@ -21,7 +21,7 @@
     "IP %s applied": "IP %s übernommen",
     "IP address used for polling and connection checks.": "IP-Adresse, die der Adapter zum Abfragen und Prüfen des Wechselrichters nutzt.",
     "Limits discovery to this /24 network. Leave empty to search local IPv4 networks.": "Begrenzt die Suche auf dieses /24-Netz. Leer sucht in den lokalen IPv4-Netzen.",
-    "Makes the grid export switch, grid export limit, EMS mode, EMS power limit, depth of discharge and battery charge current states writable. GoodWe does not document writable registers, so use this at your own risk.": "Macht die Datenpunkte Einspeisung an/aus, Einspeisebegrenzung, EMS-Modus, EMS-Leistungsgrenze, Entladetiefe und Batterieladestrom beschreibbar. GoodWe dokumentiert keine beschreibbaren Register, die Nutzung erfolgt auf eigene Gefahr.",
+    "Makes the grid export switch, grid export limit, EMS mode, EMS power limit, work mode, depth of discharge and battery charge and discharge current states writable. GoodWe does not document writable registers, so use this at your own risk.": "Macht die Datenpunkte Einspeisung an/aus, Einspeisebegrenzung, EMS-Modus, EMS-Leistungsgrenze, Arbeitsmodus, Entladetiefe sowie Lade- und Entladestrom der Batterie beschreibbar. GoodWe dokumentiert keine beschreibbaren Register, die Nutzung erfolgt auf eigene Gefahr.",
     "Master switch for the optional register groups below. Running data, meter data and BMS info are always read.": "Hauptschalter für die optionalen Registergruppen unten. Laufzeitdaten, Zählerdaten und BMS-Informationen werden immer gelesen.",
     "Milliseconds, 1000-30000": "Millisekunden, 1000-30000",
     "Modbus TCP port 502 (WiFi/LAN dongle 2.0)": "Modbus TCP, Port 502 (WLAN/LAN-Dongle 2.0)",

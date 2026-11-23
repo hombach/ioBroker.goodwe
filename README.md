@@ -65,7 +65,7 @@ Raw register values are kept as ioBroker states. Mode values are numeric states 
 | `Settings.Battery.*` | Battery capacity, module count, charge and discharge limits and depth of discharge as the SolarGo app shows it |
 | `Settings.GridExportEnabled`, `Settings.GridExportLimit` | Grid export limit switch and value |
 | `Settings.EmsMode`, `Settings.EmsPowerLimit` | EMS mode and the power the EMS mode works with |
-| `Settings.WorkMode` | Work mode set in the SolarGo app: 0 general, 1 off-grid, 2 backup, 3 eco, 4 peak shaving, 5 self-use. Read only |
+| `Settings.WorkMode` | Work mode set in the SolarGo app: 0 general, 1 off-grid, 2 backup, 3 eco, 4 peak shaving, 5 self-use. With inverter control, 0 and 3 can be written |
 | `Settings.LoadControl.*` | Load control output (mode, switch, SOC) as plain numbers, because GoodWe does not document their meaning. Read only, needs ARM firmware 19 or newer |
 
 ## Configuration
@@ -75,8 +75,8 @@ Raw register values are kept as ioBroker states. Mode values are numeric states 
 * `transport`: How the adapter talks to the inverter. `udp` (default) uses UDP port 8899, the protocol of the GoodWe WiFi dongle. `tcp` uses Modbus TCP on port 502, for the WiFi/LAN dongle 2.0 (WLA0000-01-00P), which does not answer on UDP port 8899 when it is connected by LAN.
   Modbus TCP is **experimental**: it has not been confirmed on a real dongle 2.0 yet. If it does not work for you, please open an issue with a debug log.
 * `discoverySubnet`: Optional `/24` subnet for network discovery, for example `192.168.178.0/24`.
-* `pollCycle`: Seconds between two reads of the live data (`RunningData`, `ExtComData`, `BMSInfo`) and the battery and EMS settings, from 2 to 3600.
-  The other optional register groups, `Settings.WorkMode` and `Settings.LoadControl.*` included, do not follow this cycle: they share one slot that is served round robin about every 30 seconds, and `DeviceInfo` is read once per connection.
+* `pollCycle`: Seconds between two reads of the live data (`RunningData`, `ExtComData`, `BMSInfo`) and the battery, EMS and work mode settings, from 2 to 3600.
+  The other optional register groups, `Settings.LoadControl.*` included, do not follow this cycle: they share one slot that is served round robin about every 30 seconds, and `DeviceInfo` is read once per connection.
 * `timeoutMs`: Request timeout in milliseconds, from 1000 to 30000.
 * `retries`: Retry count per request, from 0 to 5.
 * `pollExtended`: Master switch for optional register groups. `DeviceInfo`, `RunningData`, `ExtComData` and `BMSInfo` are always read.
@@ -88,7 +88,7 @@ Raw register values are kept as ioBroker states. Mode values are numeric states 
 * `pollCeiAutoTest`: Enables CEI auto test registers.
 * `pollPowerLimit`: Enables power limit registers, if supported by the inverter.
 * `pollSettings`: Enables the battery, EMS, work mode and load control setting registers.
-* `enableControl`: Makes the EMS, grid export, depth of discharge and charge current states writable, see below. Off by default.
+* `enableControl`: Makes the EMS, grid export, work mode, depth of discharge, charge current and discharge current states writable, see below. Off by default.
 
 The basic settings page also provides discovery helpers:
 
@@ -98,7 +98,7 @@ The basic settings page also provides discovery helpers:
 
 ## Inverter control
 
-With `enableControl` switched on, seven states become writable and are sent to the inverter as
+With `enableControl` switched on, nine states become writable and are sent to the inverter as
 single register writes. Every other state stays read-only.
 
 | State | Register | Range | Description |
@@ -110,13 +110,16 @@ single register writes. Every other state stays read-only.
 | `Settings.Battery.DischargeDepth` | 45356 | 0-95 % | Depth of discharge on grid, as the SolarGo app shows it |
 | `Settings.Battery.DischargeDepthOffline` | 45358 | 0-95 % | Depth of discharge off grid, as the SolarGo app shows it |
 | `Settings.Battery.ChargeCurrent` | 45353 | 0-100 A | Maximum battery charge current; the BMS may limit it further |
+| `Settings.Battery.DischargeCurrent` | 45355 | 0-100 A | Maximum battery discharge current; the BMS may limit it further. The inverter returns to its default after a reboot, so a script has to write the value again |
+| `Settings.WorkMode` | 47000 | 0, 3 | Work mode: 0 general, 3 eco |
 
-`GridExportLimit`, `EmsPowerLimit`, the depths of discharge and `ChargeCurrent` clamp values outside
-their range. The inverter stores the depth of discharge as the remaining reserve, 100 minus the value
+`GridExportLimit`, `EmsPowerLimit`, the depths of discharge, `ChargeCurrent` and `DischargeCurrent`
+clamp values outside their range. The inverter stores the depth of discharge as the remaining reserve, 100 minus the value
 shown; the adapter converts it both ways, so a written 90 % arrives as a reserve of 10 %. The range
-ends at 95 %, where the SolarGo app stops. `GridExportEnabled` and
-`EmsMode` are enum registers and accept only the values listed above - a value outside that list is
-refused instead of being clamped into a mode nobody asked for. Numbers written as plain decimal text,
+ends at 95 %, where the SolarGo app stops. `GridExportEnabled`, `EmsMode` and `WorkMode` are enum
+registers and accept only the values listed above - a value outside that list is refused instead of
+being clamped into a mode nobody asked for. `WorkMode` shows all six work modes, but only general and
+eco can be written: off-grid, backup and peak shaving change how the inverter treats the grid. Numbers written as plain decimal text,
 for example `"500"` from an input field, are accepted, and `GridExportEnabled` also takes `true` and
 `false`; any other value is refused. The states are numbers, so ioBroker notes text and booleans with an
 info line in the log of the adapter that wrote them. After a
@@ -131,12 +134,12 @@ Before a write the adapter reads the register group and skips the write when the
 the value. A script that repeats the same setpoint every cycle therefore does not send a register write
 every time.
 
-Switching `enableControl` on keeps the battery and EMS setting registers polled even when
+Switching `enableControl` on keeps the battery, EMS and work mode setting registers polled even when
 `pollSettings` or `pollExtended` is off, because the writable states have to exist and be read back. Unlike the other
 optional groups, a failed read of this group does not pause it for an hour; it is tried again in the
 next poll cycle.
 
-The battery and EMS settings are read on every poll cycle, so a change made elsewhere, for example in the GoodWe app,
+The battery, EMS and work mode settings are read on every poll cycle, so a change made elsewhere, for example in the GoodWe app,
 shows up in the states within one `pollCycle`.
 
 GoodWe does not document its writable registers. Control is off by default, and switching it on
@@ -177,6 +180,11 @@ Recurring `retry` messages on debug level mean single UDP answers are getting lo
 	Placeholder for the next version (at the beginning of the line):
 	### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+- The battery discharge current (`Settings.Battery.DischargeCurrent`, up to 100 A) can be written when inverter control is on. The inverter returns to its default after a reboot, so a script can now restore a lower limit, for example for older batteries (#60).
+- The work mode (`Settings.WorkMode`) can be written when inverter control is on, limited to general (0) and eco (3). Off-grid, backup and peak shaving are refused (#61).
+- The work mode is now read on every poll cycle together with the battery and EMS settings, instead of in the slot of the optional groups.
+
 ### 1.3.0 (2026-10-27)
 - Added Modbus TCP on port 502 as a second, experimental connection for the GoodWe WiFi/LAN dongle 2.0, which does not answer the UDP protocol on port 8899 when it is connected by LAN. Choose it under "Connection" in the basic settings; UDP stays the default. The inverter search uses the selected connection (#59).
 - The depth of discharge (on and off grid) and the battery charge current can be written when inverter control is on. The depth of discharge is written as the SolarGo app shows it; the adapter converts it into the reserve the inverter stores. The depth of discharge is limited to 95 %, the charge current to 100 A.

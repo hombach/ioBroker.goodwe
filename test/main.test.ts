@@ -143,12 +143,14 @@ describe("register map", () => {
   it("marks only the documented control registers as writable", () => {
     assert.deepEqual(Array.from(writableEntries.keys()).sort(), [
       "Settings.Battery.ChargeCurrent",
+      "Settings.Battery.DischargeCurrent",
       "Settings.Battery.DischargeDepth",
       "Settings.Battery.DischargeDepthOffline",
       "Settings.EmsMode",
       "Settings.EmsPowerLimit",
       "Settings.GridExportEnabled",
       "Settings.GridExportLimit",
+      "Settings.WorkMode",
     ]);
 
     for (const entry of writableEntries.values()) {
@@ -515,8 +517,9 @@ describe("GoodWe UDP parser", () => {
 
     assert.equal(optionalGroupConfigs.settingsWorkMode, "pollSettings");
     assert.equal(optionalGroupConfigs.settingsLoadControl, "pollSettings");
-    // Read only: nothing documents what these registers accept.
-    assert.equal(writableGroups.has("settingsWorkMode"), false);
+    // The work mode takes general and eco. Read only: nothing documents what
+    // the load control registers accept.
+    assert.equal(writableGroups.has("settingsWorkMode"), true);
     assert.equal(writableGroups.has("settingsLoadControl"), false);
   });
 
@@ -626,14 +629,13 @@ describe("state mapping", () => {
     return deleted;
   }
 
-  it("removes the work mode and load control states with pollSettings off", async () => {
+  it("removes the load control states with pollSettings off", async () => {
     const deleted = await deletedOnStart({
       pollSettings: false,
       enableControl: true,
     });
 
     for (const id of [
-      "Settings.WorkMode",
       "Settings.LoadControl.Mode",
       "Settings.LoadControl.Switch",
       "Settings.LoadControl.Soc",
@@ -642,12 +644,14 @@ describe("state mapping", () => {
       assert.ok(deleted.includes(id), `${id} not deleted`);
     }
 
-    // Inverter control still reads and writes the battery and EMS settings.
+    // Inverter control still reads and writes the battery, EMS and work mode
+    // settings.
     for (const id of [
       "Settings",
       "Settings.Battery",
       "Settings.Battery.DischargeDepth",
       "Settings.EmsMode",
+      "Settings.WorkMode",
     ]) {
       assert.equal(deleted.includes(id), false, `${id} deleted`);
     }
@@ -1272,6 +1276,7 @@ describe("poll traffic", () => {
       "bmsInfo",
       "settingsBattery",
       "settingsEms",
+      "settingsWorkMode",
     ]) {
       assert.equal(
         reads.filter((name) => name === groupName).length,
@@ -1328,17 +1333,22 @@ describe("poll traffic", () => {
     });
 
     // 300 seconds: 60 live cycles and ten slow slots, enough for every one of
-    // the nine optional groups once.
+    // the eight optional groups once.
     for (let tick = 0; tick < 300; tick++) {
       await scheduler.Poll();
     }
 
-    for (const groupName of ["settingsWorkMode", "settingsLoadControl"]) {
-      const count = reads.filter((name) => name === groupName).length;
+    const count = reads.filter((name) => name === "settingsLoadControl").length;
 
-      assert.ok(count >= 1 && count <= 2, `${groupName} read ${count} times`);
-    }
+    assert.ok(
+      count >= 1 && count <= 2,
+      `settingsLoadControl read ${count} times`,
+    );
     assert.equal(reads.filter((name) => name === "settingsEms").length, 60);
+    assert.equal(
+      reads.filter((name) => name === "settingsWorkMode").length,
+      60,
+    );
   });
 
   it("keeps the request count per minute well below the live cycle", async () => {
@@ -1351,10 +1361,10 @@ describe("poll traffic", () => {
       await scheduler.Poll();
     }
 
-    // Three live groups and two settings groups twelve times plus two optional
-    // reads plus the single device info read. Every extra request is another
-    // one that can be lost.
-    assert.equal(reads.length, 63);
+    // Three live groups and three settings groups twelve times plus two
+    // optional reads plus the single device info read. Every extra request is
+    // another one that can be lost.
+    assert.equal(reads.length, 75);
   });
 
   it("reads the static device data once per connection", async () => {
@@ -1409,10 +1419,15 @@ describe("poll traffic", () => {
       Array.from({ length: 12 }, () => [
         "settingsBattery",
         "settingsEms",
+        "settingsWorkMode",
       ]).flat(),
     );
     // One lost answer must not freeze the writable states for an hour.
-    for (const groupName of ["settingsBattery", "settingsEms"]) {
+    for (const groupName of [
+      "settingsBattery",
+      "settingsEms",
+      "settingsWorkMode",
+    ]) {
       assert.deepEqual(readOptions.get(groupName), {
         optional: true,
         backoff: false,
@@ -1876,6 +1891,38 @@ describe("inverter control", () => {
     assert.equal(clampWriteValue(current, "abc"), null);
   });
 
+  it("writes the battery discharge current in tenths of an ampere", () => {
+    const current = writableEntries.get(
+      "Settings.Battery.DischargeCurrent",
+    ) as RegisterEntry;
+
+    assert.equal(current.address, 45355);
+    assert.equal(clampWriteValue(current, 12), 120);
+    assert.equal(clampWriteValue(current, "12.5"), 125);
+    assert.equal(clampWriteValue(current, 0), 0);
+    assert.equal(clampWriteValue(current, 100), 1000);
+    assert.equal(clampWriteValue(current, 100.1), 1000);
+    assert.equal(clampWriteValue(current, -1), 0);
+    assert.equal(clampWriteValue(current, true), null);
+    assert.equal(clampWriteValue(current, "12 A"), null);
+    assert.equal(clampWriteValue(current, Number.NaN), null);
+  });
+
+  it("writes only general and eco to the work mode", () => {
+    const workMode = writableEntries.get("Settings.WorkMode") as RegisterEntry;
+
+    assert.equal(workMode.address, 47000);
+    assert.equal(clampWriteValue(workMode, 0), 0);
+    assert.equal(clampWriteValue(workMode, 3), 3);
+    assert.equal(clampWriteValue(workMode, "3"), 3);
+    // Off-grid, backup, peak shaving and self-use exist, but a script must not
+    // reach them; neither clamping nor rounding may turn a typo into one.
+    for (const value of [1, 2, 4, 5, -1, 99, 2.9, 3.1, true, false, "eco"]) {
+      assert.equal(clampWriteValue(workMode, value), null, String(value));
+    }
+    assert.equal(clampWriteValue(workMode, null), null);
+  });
+
   it("converts the depth of discharge back into the reserve register", () => {
     for (const id of [
       "Settings.Battery.DischargeDepth",
@@ -1927,12 +1974,14 @@ describe("inverter control", () => {
   it("subscribes exactly the writable states", () => {
     assert.deepEqual(writableStateIds().sort(), [
       "Settings.Battery.ChargeCurrent",
+      "Settings.Battery.DischargeCurrent",
       "Settings.Battery.DischargeDepth",
       "Settings.Battery.DischargeDepthOffline",
       "Settings.EmsMode",
       "Settings.EmsPowerLimit",
       "Settings.GridExportEnabled",
       "Settings.GridExportLimit",
+      "Settings.WorkMode",
     ]);
   });
 
@@ -2301,6 +2350,7 @@ describe("inverter control", () => {
     assert.deepEqual(Array.from(writableGroups), [
       "settingsBattery",
       "settingsEms",
+      "settingsWorkMode",
     ]);
 
     const manager = new GoodWeStateManager(

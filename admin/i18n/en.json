@@ -21,7 +21,7 @@
     "IP %s applied": "IP %s applied",
     "IP address used for polling and connection checks.": "IP address used for polling and connection checks.",
     "Limits discovery to this /24 network. Leave empty to search local IPv4 networks.": "Limits discovery to this /24 network. Leave empty to search local IPv4 networks.",
-    "Makes the grid export switch, grid export limit, EMS mode, EMS power limit, depth of discharge and battery charge current states writable. GoodWe does not document writable registers, so use this at your own risk.": "Makes the grid export switch, grid export limit, EMS mode, EMS power limit, depth of discharge and battery charge current states writable. GoodWe does not document writable registers, so use this at your own risk.",
+    "Makes the grid export switch, grid export limit, EMS mode, EMS power limit, work mode, depth of discharge and battery charge and discharge current states writable. GoodWe does not document writable registers, so use this at your own risk.": "Makes the grid export switch, grid export limit, EMS mode, EMS power limit, work mode, depth of discharge and battery charge and discharge current states writable. GoodWe does not document writable registers, so use this at your own risk.",
     "Master switch for the optional register groups below. Running data, meter data and BMS info are always read.": "Master switch for the optional register groups below. Running data, meter data and BMS info are always read.",
     "Milliseconds, 1000-30000": "Milliseconds, 1000-30000",
     "Modbus TCP port 502 (WiFi/LAN dongle 2.0)": "Modbus TCP port 502 (WiFi/LAN dongle 2.0)",
