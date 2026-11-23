@@ -118,8 +118,13 @@ clamp values outside their range. The inverter stores the depth of discharge as 
 shown; the adapter converts it both ways, so a written 90 % arrives as a reserve of 10 %. The range
 ends at 95 %, where the SolarGo app stops. `GridExportEnabled`, `EmsMode` and `WorkMode` are enum
 registers and accept only the values listed above - a value outside that list is refused instead of
-being clamped into a mode nobody asked for. `WorkMode` shows all six work modes, but only general and
-eco can be written: off-grid, backup and peak shaving change how the inverter treats the grid. Numbers written as plain decimal text,
+being clamped into a mode nobody asked for. `WorkMode` shows all six work modes, because the SolarGo app can set any of them, but only general and
+eco can be written: off-grid, backup and peak shaving change how the inverter treats the grid, and
+self-use exists only on newer inverter platforms, not on the ET series. The adapter writes only the
+work mode register. The SolarGo app and the Home Assistant integration also set the EMS mode back to
+auto when they switch the work mode; a manual EMS mode such as charge battery can keep the inverter
+from following the new work mode. A script that has changed `EmsMode` writes `EmsMode` = 1 (auto)
+before it writes `WorkMode`. Numbers written as plain decimal text,
 for example `"500"` from an input field, are accepted, and `GridExportEnabled` also takes `true` and
 `false`; any other value is refused. The states are numbers, so ioBroker notes text and booleans with an
 info line in the log of the adapter that wrote them. After a
@@ -182,8 +187,8 @@ Recurring `retry` messages on debug level mean single UDP answers are getting lo
 -->
 ### **WORK IN PROGRESS**
 - The battery discharge current (`Settings.Battery.DischargeCurrent`, up to 100 A) can be written when inverter control is on. The inverter returns to its default after a reboot, so a script can now restore a lower limit, for example for older batteries (#60).
-- The work mode (`Settings.WorkMode`) can be written when inverter control is on, limited to general (0) and eco (3). Off-grid, backup and peak shaving are refused (#61).
-- The work mode is now read on every poll cycle together with the battery and EMS settings, instead of in the slot of the optional groups.
+- The work mode (`Settings.WorkMode`) can be written when inverter control is on, limited to general (0) and eco (3). Off-grid, backup, peak shaving and self-use are refused. Only the work mode register is written: a script that has set a manual EMS mode sets `EmsMode` back to auto (1) first (#61).
+- The work mode is now read on every poll cycle together with the battery and EMS settings, instead of in the slot of the optional groups. With inverter control on, it is read even when `pollSettings` or `pollExtended` is off, which adds one request per poll cycle.
 
 ### 1.3.0 (2026-10-27)
 - Added Modbus TCP on port 502 as a second, experimental connection for the GoodWe WiFi/LAN dongle 2.0, which does not answer the UDP protocol on port 8899 when it is connected by LAN. Choose it under "Connection" in the basic settings; UDP stays the default. The inverter search uses the selected connection (#59).

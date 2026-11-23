@@ -594,7 +594,13 @@ const registerGroups = {
     // mode values follow marcelblijleven/goodwe; a live GW10K-ET with ARM
     // firmware 29 answers both, older firmware may reject the load control.
     // Only general and eco may be written: off-grid, backup and peak shaving
-    // change how the inverter treats the grid, so a typo must not get there.
+    // change how the inverter treats the grid, so a typo must not get there, and
+    // self-use exists only on the newer 745 platform, not on the ET series.
+    // common.states keeps all six modes on purpose: the SolarGo app can set any
+    // of them, and the state has to name the mode the inverter reports.
+    // marcelblijleven/goodwe also sets EMS mode auto (47511/47512 = 1/0) on every
+    // mode switch and writes 47533 = 1 for general. The adapter writes only 47000;
+    // the README tells scripts to set the EMS mode to auto themselves.
     settingsWorkMode: {
         name: "Settings.WorkMode",
         start: 47000,
