@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.writableGroups = exports.writableEntries = exports.registerGroups = exports.TYPE = exports.optionalGroupConfigs = void 0;
 exports.registerGroupOfState = registerGroupOfState;
 exports.toStateValue = toStateValue;
+const eco_mode_1 = require("./eco-mode");
 const status_definitions_1 = require("./status-definitions");
 const TYPE = {
     U16: "U16",
@@ -614,6 +615,17 @@ const registerGroups = {
             }),
         ],
     },
+    // Eco mode time slots of firmware before ARM 19 (EcoModeV1), addresses and
+    // layout from marcelblijleven/goodwe. Newer firmware keeps its slots at
+    // 47547 (EcoModeV2), which this group does not cover.
+    settingsEcoMode: {
+        name: "Settings.EcoMode",
+        start: eco_mode_1.ECO_MODE_GROUP_STARTS[0],
+        count: eco_mode_1.ECO_MODE_GROUP_STARTS.length * 4,
+        channel: "Settings",
+        target: "Settings",
+        entries: eco_mode_1.ECO_MODE_GROUP_STARTS.flatMap((start, index) => ecoModeEntries(index + 1, start)),
+    },
     // What the load control values mean is not documented anywhere reliable, so
     // they stay plain numbers.
     settingsLoadControl: {
@@ -641,6 +653,7 @@ const optionalGroupConfigs = {
     settingsBattery: "pollSettings",
     settingsEms: "pollSettings",
     settingsWorkMode: "pollSettings",
+    settingsEcoMode: "pollSettings",
     settingsLoadControl: "pollSettings",
 };
 exports.optionalGroupConfigs = optionalGroupConfigs;
@@ -676,6 +689,9 @@ function registerGroupOfState(state) {
  * @param register register value
  */
 function toStateValue(item, register) {
+    if (item.flag) {
+        return register === 0 ? 0 : 1;
+    }
     const scaled = register / item.scale;
     return item.complement === undefined ? scaled : item.complement - scaled;
 }
@@ -693,7 +709,60 @@ function entry(address, state, model, type, options = {}) {
         states: options.states,
         writable: options.writable,
         complement: options.complement,
+        flag: options.flag,
+        ecoSlot: options.ecoSlot,
     };
+}
+/**
+ * Returns the entries of one eco mode time slot group.
+ *
+ * Every field is writable on its own; the control path reads the whole group,
+ * replaces the field and writes all four registers at once.
+ *
+ * @param group group number, 1 to 4
+ * @param start first register of the group
+ */
+function ecoModeEntries(group, start) {
+    const prefix = `Settings.EcoMode.Group${group}`;
+    const model = `EcoMode.Group${group}`;
+    const field = (name, address, type, options) => entry(address, `${prefix}.${name}`, `${model}.${name}`, type, {
+        ...options,
+        ecoSlot: { start, field: name },
+    });
+    return [
+        field("StartHour", start, TYPE.BYTE, {
+            byteOffset: 0,
+            writable: { min: 0, max: 23, strict: true },
+        }),
+        field("StartMinute", start, TYPE.BYTE, {
+            byteOffset: 1,
+            writable: { min: 0, max: 59, strict: true },
+        }),
+        field("EndHour", start + 1, TYPE.BYTE, {
+            byteOffset: 0,
+            writable: { min: 0, max: 23, strict: true },
+        }),
+        field("EndMinute", start + 1, TYPE.BYTE, {
+            byteOffset: 1,
+            writable: { min: 0, max: 59, strict: true },
+        }),
+        // Negative charges the battery, positive discharges it.
+        field("Power", start + 2, TYPE.S16, {
+            unit: "%",
+            writable: { min: -100, max: 100, strict: true },
+        }),
+        field("Enabled", start + 3, TYPE.BYTE, {
+            byteOffset: 0,
+            flag: true,
+            states: status_definitions_1.valueStates.ecoModeSwitch,
+            writable: { min: 0, max: 1 },
+        }),
+        // Bit 0 Sunday to bit 6 Saturday, 127 every day.
+        field("Days", start + 3, TYPE.BYTE, {
+            byteOffset: 1,
+            writable: { min: 0, max: 127, strict: true },
+        }),
+    ];
 }
 function typeRegisterCount(type) {
     switch (type) {

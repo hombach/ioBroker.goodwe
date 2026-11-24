@@ -1,5 +1,6 @@
 "use strict";
 
+import { ECO_MODE_GROUP_STARTS, type EcoField } from "./eco-mode";
 import { valueStates, type ValueStateMap } from "./status-definitions";
 
 const TYPE = {
@@ -22,6 +23,17 @@ interface WritableRange {
   // Register values a script may send, when only some values inside the range
   // are safe. Anything else is refused, never clamped.
   values?: readonly number[];
+  // Refuse values outside the range or with a fraction instead of clamping or
+  // rounding them. For registers where a clamped value is a different setting,
+  // like the hour of an eco mode time slot.
+  strict?: boolean;
+}
+
+// Eco mode time slot field: the state stands for one field of a four register
+// group that is always written as a whole (see src/lib/eco-mode.ts).
+interface EcoSlotField {
+  start: number;
+  field: EcoField;
 }
 
 interface RegisterEntry {
@@ -38,6 +50,9 @@ interface RegisterEntry {
   writable?: WritableRange;
   // The state shows complement minus the register value.
   complement?: number;
+  // The state shows 1 for every register value but 0, and 0 for 0.
+  flag?: boolean;
+  ecoSlot?: EcoSlotField;
 }
 
 interface RegisterGroup {
@@ -60,6 +75,8 @@ interface EntryOptions {
   states?: ValueStateMap;
   writable?: WritableRange;
   complement?: number;
+  flag?: boolean;
+  ecoSlot?: EcoSlotField;
 }
 
 const registerGroups: Record<string, RegisterGroup> = {
@@ -1184,6 +1201,20 @@ const registerGroups: Record<string, RegisterGroup> = {
     ],
   },
 
+  // Eco mode time slots of firmware before ARM 19 (EcoModeV1), addresses and
+  // layout from marcelblijleven/goodwe. Newer firmware keeps its slots at
+  // 47547 (EcoModeV2), which this group does not cover.
+  settingsEcoMode: {
+    name: "Settings.EcoMode",
+    start: ECO_MODE_GROUP_STARTS[0],
+    count: ECO_MODE_GROUP_STARTS.length * 4,
+    channel: "Settings",
+    target: "Settings",
+    entries: ECO_MODE_GROUP_STARTS.flatMap((start, index) =>
+      ecoModeEntries(index + 1, start),
+    ),
+  },
+
   // What the load control values mean is not documented anywhere reliable, so
   // they stay plain numbers.
   settingsLoadControl: {
@@ -1216,6 +1247,7 @@ const optionalGroupConfigs: Record<string, string> = {
   settingsBattery: "pollSettings",
   settingsEms: "pollSettings",
   settingsWorkMode: "pollSettings",
+  settingsEcoMode: "pollSettings",
   settingsLoadControl: "pollSettings",
 };
 
@@ -1259,6 +1291,10 @@ function registerGroupOfState(state: string): string {
  * @param register register value
  */
 function toStateValue(item: RegisterEntry, register: number): number {
+  if (item.flag) {
+    return register === 0 ? 0 : 1;
+  }
+
   const scaled = register / item.scale;
   return item.complement === undefined ? scaled : item.complement - scaled;
 }
@@ -1283,7 +1319,68 @@ function entry(
     states: options.states,
     writable: options.writable,
     complement: options.complement,
+    flag: options.flag,
+    ecoSlot: options.ecoSlot,
   };
+}
+
+/**
+ * Returns the entries of one eco mode time slot group.
+ *
+ * Every field is writable on its own; the control path reads the whole group,
+ * replaces the field and writes all four registers at once.
+ *
+ * @param group group number, 1 to 4
+ * @param start first register of the group
+ */
+function ecoModeEntries(group: number, start: number): RegisterEntry[] {
+  const prefix = `Settings.EcoMode.Group${group}`;
+  const model = `EcoMode.Group${group}`;
+  const field = (
+    name: EcoField,
+    address: number,
+    type: RegisterType,
+    options: EntryOptions,
+  ): RegisterEntry =>
+    entry(address, `${prefix}.${name}`, `${model}.${name}`, type, {
+      ...options,
+      ecoSlot: { start, field: name },
+    });
+
+  return [
+    field("StartHour", start, TYPE.BYTE, {
+      byteOffset: 0,
+      writable: { min: 0, max: 23, strict: true },
+    }),
+    field("StartMinute", start, TYPE.BYTE, {
+      byteOffset: 1,
+      writable: { min: 0, max: 59, strict: true },
+    }),
+    field("EndHour", start + 1, TYPE.BYTE, {
+      byteOffset: 0,
+      writable: { min: 0, max: 23, strict: true },
+    }),
+    field("EndMinute", start + 1, TYPE.BYTE, {
+      byteOffset: 1,
+      writable: { min: 0, max: 59, strict: true },
+    }),
+    // Negative charges the battery, positive discharges it.
+    field("Power", start + 2, TYPE.S16, {
+      unit: "%",
+      writable: { min: -100, max: 100, strict: true },
+    }),
+    field("Enabled", start + 3, TYPE.BYTE, {
+      byteOffset: 0,
+      flag: true,
+      states: valueStates.ecoModeSwitch,
+      writable: { min: 0, max: 1 },
+    }),
+    // Bit 0 Sunday to bit 6 Saturday, 127 every day.
+    field("Days", start + 3, TYPE.BYTE, {
+      byteOffset: 1,
+      writable: { min: 0, max: 127, strict: true },
+    }),
+  ];
 }
 
 function typeRegisterCount(type: RegisterType): number {

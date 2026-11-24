@@ -41,6 +41,10 @@ const valueStates = {
         4: "Peak shaving",
         5: "Self-use",
     },
+    ecoModeSwitch: {
+        0: "Off",
+        1: "On",
+    },
     operationMode: {
         1: "Wait",
         2: "Online",

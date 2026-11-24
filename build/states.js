@@ -1,10 +1,15 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const config_1 = require("./lib/config");
+const eco_mode_1 = require("./lib/eco-mode");
 const register_map_1 = require("./lib/register-map");
 const status_mapper_1 = require("./mappers/status-mapper");
+// One readable summary per eco mode time slot, for example
+// "01:00-05:00, Mon-Sun, -50 %, on".
+const ecoModeSummaryStates = eco_mode_1.ECO_MODE_GROUP_STARTS.map((_, index) => `Settings.EcoMode.Group${index + 1}.Summary`);
 const optionalDerivedStates = {
     bmsInfoExtended: ["BMSInfo.WarningCodeActive", "BMSInfo.DRMStatusActive"],
+    settingsEcoMode: ecoModeSummaryStates,
 };
 const legacyModeTextStates = [
     "RunningData.GridModeText",
@@ -269,6 +274,21 @@ class GoodWeStateManager {
             },
             native: {},
         });
+        if (this.IsRegisterGroupEnabled("settingsEcoMode")) {
+            for (const state of ecoModeSummaryStates) {
+                await this.adapter.setObjectNotExistsAsync(state, {
+                    type: "state",
+                    common: {
+                        name: "Summary",
+                        type: "string",
+                        role: "text",
+                        read: true,
+                        write: false,
+                    },
+                    native: {},
+                });
+            }
+        }
     }
     async CleanupDisabledOptionalStates() {
         const enabledChannels = new Set();
@@ -369,6 +389,42 @@ class GoodWeStateManager {
         const source = this.inverter[group.target];
         for (const item of group.entries) {
             await this.Write(item.state, this.GetStateValue(item.state, item.model, source));
+        }
+        if (group === register_map_1.registerGroups.settingsEcoMode) {
+            await this.UpdateEcoModeSummaries(source);
+        }
+    }
+    /**
+     * Writes the readable summary of every eco mode time slot.
+     *
+     * @param source parsed settings of the inverter
+     */
+    async UpdateEcoModeSummaries(source) {
+        for (const [index, state] of ecoModeSummaryStates.entries()) {
+            const value = (field) => Number(this.GetMappedValue(`EcoMode.Group${index + 1}.${field}`, source));
+            const fields = [
+                "StartHour",
+                "StartMinute",
+                "EndHour",
+                "EndMinute",
+                "Power",
+                "Enabled",
+                "Days",
+            ].map(value);
+            // Not read yet: a summary of NaN would only confuse.
+            if (fields.some((field) => !Number.isFinite(field))) {
+                continue;
+            }
+            const [startHour, startMinute, endHour, endMinute, power, enabled, days] = fields;
+            await this.Write(state, (0, eco_mode_1.describeEcoSlot)({
+                startHour,
+                startMinute,
+                endHour,
+                endMinute,
+                power,
+                onOff: enabled === 0 ? eco_mode_1.ECO_OFF : eco_mode_1.ECO_ON,
+                days,
+            }));
         }
     }
     /**

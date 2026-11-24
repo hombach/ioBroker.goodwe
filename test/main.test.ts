@@ -28,6 +28,14 @@ import {
 } from "../src/lib/control";
 import { bitfields, decodeBitfield } from "../src/lib/status-definitions";
 import {
+  decodeEcoDays,
+  decodeEcoSlot,
+  describeEcoSlot,
+  encodeEcoSlot,
+  validateEcoSlot,
+  withEcoField,
+} from "../src/lib/eco-mode";
+import {
   booleanDefaults,
   normalizeBoolean,
   normalizeBooleanConfig,
@@ -141,22 +149,32 @@ describe("register map", () => {
   });
 
   it("marks only the documented control registers as writable", () => {
-    assert.deepEqual(Array.from(writableEntries.keys()).sort(), [
-      "Settings.Battery.ChargeCurrent",
-      "Settings.Battery.DischargeCurrent",
-      "Settings.Battery.DischargeDepth",
-      "Settings.Battery.DischargeDepthOffline",
-      "Settings.EmsMode",
-      "Settings.EmsPowerLimit",
-      "Settings.GridExportEnabled",
-      "Settings.GridExportLimit",
-      "Settings.WorkMode",
-    ]);
+    assert.deepEqual(
+      Array.from(writableEntries.keys())
+        .filter((id) => !id.startsWith("Settings.EcoMode."))
+        .sort(),
+      [
+        "Settings.Battery.ChargeCurrent",
+        "Settings.Battery.DischargeCurrent",
+        "Settings.Battery.DischargeDepth",
+        "Settings.Battery.DischargeDepthOffline",
+        "Settings.EmsMode",
+        "Settings.EmsPowerLimit",
+        "Settings.GridExportEnabled",
+        "Settings.GridExportLimit",
+        "Settings.WorkMode",
+      ],
+    );
 
     for (const entry of writableEntries.values()) {
-      // A multi register write would need an encoder, so the control path only
-      // accepts values that fit into a single register.
+      // Every state stands for at most one register. The eco mode time slot
+      // fields are written as their whole group by the eco mode encoder.
       assert.equal(entry.registers, 1, `${entry.state} spans registers`);
+      if (entry.state.startsWith("Settings.EcoMode.")) {
+        assert.ok(entry.ecoSlot, `${entry.state} has no eco mode group`);
+      } else {
+        assert.equal(entry.ecoSlot, undefined);
+      }
       assert.ok(entry.writable && entry.writable.min < entry.writable.max);
     }
   });
@@ -644,14 +662,16 @@ describe("state mapping", () => {
       assert.ok(deleted.includes(id), `${id} not deleted`);
     }
 
-    // Inverter control still reads and writes the battery, EMS and work mode
-    // settings.
+    // Inverter control still reads and writes the battery, EMS, work mode and
+    // eco mode settings.
     for (const id of [
       "Settings",
       "Settings.Battery",
       "Settings.Battery.DischargeDepth",
       "Settings.EmsMode",
       "Settings.WorkMode",
+      "Settings.EcoMode.Group1.Power",
+      "Settings.EcoMode.Group1.Summary",
     ]) {
       assert.equal(deleted.includes(id), false, `${id} deleted`);
     }
@@ -673,6 +693,10 @@ describe("state mapping", () => {
       "Settings.Battery.DischargeDepth",
       "Settings.EmsMode",
       "Settings.WorkMode",
+      "Settings.EcoMode.Group1.Power",
+      "Settings.EcoMode.Group4.Summary",
+      "Settings.EcoMode.Group1",
+      "Settings.EcoMode",
       "Settings.Battery",
       "Settings",
     ]) {
@@ -1414,12 +1438,15 @@ describe("poll traffic", () => {
     }
 
     // The writable states would otherwise only change after a write of their own.
+    // Battery, EMS and work mode on every cycle, the eco mode time slots in
+    // the optional slot every 30 seconds.
     assert.deepEqual(
       reads.filter((groupName) => groupName in optionalGroupConfigs),
-      Array.from({ length: 12 }, () => [
+      Array.from({ length: 12 }, (_, cycle) => [
         "settingsBattery",
         "settingsEms",
         "settingsWorkMode",
+        ...(cycle % 6 === 0 ? ["settingsEcoMode"] : []),
       ]).flat(),
     );
     // One lost answer must not freeze the writable states for an hour.
@@ -1427,6 +1454,7 @@ describe("poll traffic", () => {
       "settingsBattery",
       "settingsEms",
       "settingsWorkMode",
+      "settingsEcoMode",
     ]) {
       assert.deepEqual(readOptions.get(groupName), {
         optional: true,
@@ -1768,16 +1796,24 @@ describe("inverter control", () => {
       stored?: number;
       online?: boolean;
       closed?: boolean;
+      // Eco mode group the inverter holds; null makes the read fail.
+      ecoGroup?: string | null;
+      // The inverter answers the EcoModeV2 probe at 47547.
+      ecoV2?: boolean;
     } = {},
   ): {
     acknowledged: StateWrite[];
     context: Parameters<typeof applyControlWrite>[0];
+    multiWrites: Array<{ start: number; values: number[] }>;
     readOptions: unknown[];
+    registerReads: Array<{ start: number; count: number }>;
     reads: string[];
     sequence: string[];
     updated: string[];
     writes: Array<{ address: number; value: number }>;
   } {
+    const multiWrites: Array<{ start: number; values: number[] }> = [];
+    const registerReads: Array<{ start: number; count: number }> = [];
     const writes: Array<{ address: number; value: number }> = [];
     const reads: string[] = [];
     const readOptions: unknown[] = [];
@@ -1787,6 +1823,8 @@ describe("inverter control", () => {
 
     return {
       acknowledged,
+      multiWrites,
+      registerReads,
       context: {
         adapter: { log: testLogger, namespace: "goodwe.0" },
         inverter: {
@@ -1796,6 +1834,31 @@ describe("inverter control", () => {
             writes.push({ address, value });
             sequence.push("write");
             return Promise.resolve(options.writeConfirmed !== false);
+          },
+          WriteRegisters: (start: number, values: number[]) => {
+            multiWrites.push({ start, values });
+            sequence.push("write");
+            return Promise.resolve(options.writeConfirmed !== false);
+          },
+          ReadRegisters: (start: number, count: number) => {
+            registerReads.push({ start, count });
+
+            if (start === 47547) {
+              return Promise.resolve(
+                options.ecoV2 === true ? new Uint8Array(count * 2) : null,
+              );
+            }
+
+            const group =
+              options.ecoGroup === undefined
+                ? "3000300000640000"
+                : options.ecoGroup;
+
+            return Promise.resolve(
+              group === null
+                ? null
+                : Uint8Array.from(Buffer.from(group, "hex")),
+            );
           },
           ReadGroup: (groupName: string, groupOptions?: unknown) => {
             reads.push(groupName);
@@ -1972,17 +2035,33 @@ describe("inverter control", () => {
   });
 
   it("subscribes exactly the writable states", () => {
-    assert.deepEqual(writableStateIds().sort(), [
-      "Settings.Battery.ChargeCurrent",
-      "Settings.Battery.DischargeCurrent",
-      "Settings.Battery.DischargeDepth",
-      "Settings.Battery.DischargeDepthOffline",
-      "Settings.EmsMode",
-      "Settings.EmsPowerLimit",
-      "Settings.GridExportEnabled",
-      "Settings.GridExportLimit",
-      "Settings.WorkMode",
-    ]);
+    const ecoStates = [1, 2, 3, 4].flatMap((group) =>
+      [
+        "Days",
+        "Enabled",
+        "EndHour",
+        "EndMinute",
+        "Power",
+        "StartHour",
+        "StartMinute",
+      ].map((field) => `Settings.EcoMode.Group${group}.${field}`),
+    );
+
+    assert.deepEqual(
+      writableStateIds().sort(),
+      [
+        "Settings.Battery.ChargeCurrent",
+        "Settings.Battery.DischargeCurrent",
+        "Settings.Battery.DischargeDepth",
+        "Settings.Battery.DischargeDepthOffline",
+        ...ecoStates,
+        "Settings.EmsMode",
+        "Settings.EmsPowerLimit",
+        "Settings.GridExportEnabled",
+        "Settings.GridExportLimit",
+        "Settings.WorkMode",
+      ].sort(),
+    );
   });
 
   it("strips the adapter namespace from a state id", () => {
@@ -2351,6 +2430,7 @@ describe("inverter control", () => {
       "settingsBattery",
       "settingsEms",
       "settingsWorkMode",
+      "settingsEcoMode",
     ]);
 
     const manager = new GoodWeStateManager(
@@ -2371,6 +2451,210 @@ describe("inverter control", () => {
     assert.equal(manager.IsRegisterGroupEnabled("settingsEms"), true);
     assert.equal(manager.IsRegisterGroupEnabled("settingsBattery"), true);
     assert.equal(manager.IsRegisterGroupEnabled("bmsDetail"), false);
+  });
+
+  describe("eco mode time slots", () => {
+    const write = (
+      control: ReturnType<typeof createControlContext>,
+      id: string,
+      val: ioBroker.StateValue,
+    ): Promise<void> =>
+      applyControlWrite(control.context, `goodwe.0.${id}`, {
+        val,
+        ack: false,
+      } as ioBroker.State);
+
+    it("sends nothing at all while control is off", async () => {
+      const control = createControlContext(false);
+
+      for (const [id, val] of [
+        ["Settings.EcoMode.Group1.Power", -50],
+        ["Settings.EcoMode.Group1.Enabled", true],
+        ["Settings.EcoMode.Group2.StartHour", 1],
+        ["Settings.WorkMode", 3],
+      ] as const) {
+        await write(control, id, val);
+      }
+
+      assert.deepEqual(control.writes, []);
+      assert.deepEqual(control.multiWrites, []);
+      assert.deepEqual(control.registerReads, []);
+      assert.deepEqual(control.reads, []);
+    });
+
+    it("ignores acknowledged eco mode states", async () => {
+      const control = createControlContext(true);
+
+      await applyControlWrite(
+        control.context,
+        "goodwe.0.Settings.EcoMode.Group1.Power",
+        { val: -50, ack: true } as ioBroker.State,
+      );
+
+      assert.deepEqual(control.multiWrites, []);
+      assert.deepEqual(control.registerReads, []);
+    });
+
+    it("refuses out of range values without touching the inverter", async () => {
+      const control = createControlContext(true);
+
+      for (const [id, val] of [
+        ["Settings.EcoMode.Group1.StartHour", 24],
+        ["Settings.EcoMode.Group1.StartHour", -1],
+        ["Settings.EcoMode.Group1.StartHour", 7.5],
+        ["Settings.EcoMode.Group1.EndMinute", 60],
+        ["Settings.EcoMode.Group1.Power", 101],
+        ["Settings.EcoMode.Group1.Power", -101],
+        ["Settings.EcoMode.Group1.Days", 128],
+        ["Settings.EcoMode.Group1.Enabled", 2],
+        ["Settings.EcoMode.Group1.Power", "abc"],
+      ] as const) {
+        await write(control, id, val);
+      }
+
+      assert.deepEqual(control.multiWrites, []);
+      assert.deepEqual(control.registerReads, []);
+    });
+
+    it("writes the whole group in one request with the new field", async () => {
+      const control = createControlContext(true, {
+        ecoGroup: "0100053b0032ff7f",
+      });
+
+      await write(control, "Settings.EcoMode.Group1.Power", -50);
+
+      // Probe for EcoModeV2 first, then read the group fresh.
+      assert.deepEqual(control.registerReads, [
+        { start: 47547, count: 6 },
+        { start: 47515, count: 4 },
+      ]);
+      assert.deepEqual(control.multiWrites, [
+        { start: 47515, values: [0x0100, 0x053b, 0xffce, 0xff7f] },
+      ]);
+      assert.deepEqual(control.writes, []);
+      assert.deepEqual(control.reads, ["settingsEcoMode"]);
+    });
+
+    it("addresses the group of the written state", async () => {
+      const control = createControlContext(true, {
+        ecoGroup: "0100053b0032007f",
+      });
+
+      await write(control, "Settings.EcoMode.Group4.EndHour", 6);
+
+      assert.deepEqual(control.multiWrites, [
+        { start: 47527, values: [0x0100, 0x063b, 0x0032, 0x007f] },
+      ]);
+    });
+
+    it("fills an unused group field by field while it stays off", async () => {
+      const control = createControlContext(true);
+
+      await write(control, "Settings.EcoMode.Group2.StartHour", 1);
+
+      // Hour 48 of the untouched end time stays, the group stays off.
+      assert.deepEqual(control.multiWrites, [
+        { start: 47519, values: [0x0100, 0x3000, 0x0064, 0x0000] },
+      ]);
+    });
+
+    it("refuses to switch on a group without times", async () => {
+      const control = createControlContext(true);
+
+      await write(control, "Settings.EcoMode.Group1.Enabled", true);
+
+      assert.deepEqual(control.multiWrites, []);
+      // Read back, so the refused value does not stay on the state.
+      assert.deepEqual(control.reads, ["settingsEcoMode"]);
+    });
+
+    it("switches a complete group on with 0xFF like marcelblijleven/goodwe", async () => {
+      const control = createControlContext(true, {
+        ecoGroup: "0100053bffce007f",
+      });
+
+      await write(control, "Settings.EcoMode.Group1.Enabled", 1);
+
+      assert.deepEqual(control.multiWrites, [
+        { start: 47515, values: [0x0100, 0x053b, 0xffce, 0xff7f] },
+      ]);
+    });
+
+    it("does not write the old slots on EcoModeV2 firmware", async () => {
+      const control = createControlContext(true, { ecoV2: true });
+
+      await write(control, "Settings.EcoMode.Group1.Power", -50);
+
+      assert.deepEqual(control.multiWrites, []);
+      assert.deepEqual(control.registerReads, [{ start: 47547, count: 6 }]);
+    });
+
+    it("writes nothing when the group cannot be read", async () => {
+      const control = createControlContext(true, { ecoGroup: null });
+
+      await write(control, "Settings.EcoMode.Group1.Power", -50);
+
+      assert.deepEqual(control.multiWrites, []);
+    });
+
+    it("skips a group the inverter already holds", async () => {
+      const control = createControlContext(true, {
+        ecoGroup: "0100053bffceff7f",
+      });
+
+      await write(control, "Settings.EcoMode.Group1.Power", -50);
+
+      assert.deepEqual(control.multiWrites, []);
+      assert.deepEqual(control.updated, ["Settings.EcoMode"]);
+    });
+
+    it("refuses a write while the inverter is offline", async () => {
+      const control = createControlContext(true, { online: false });
+
+      await write(control, "Settings.EcoMode.Group1.Power", -50);
+
+      assert.deepEqual(control.registerReads, []);
+      assert.deepEqual(control.multiWrites, []);
+    });
+
+    it("writes only general and eco as work mode", async () => {
+      const control = createControlContext(true);
+
+      await write(control, "Settings.WorkMode", 3);
+      await write(control, "Settings.WorkMode", "0");
+
+      for (const refused of [1, 2, 4, 5, 6, 3.5, true]) {
+        await write(control, "Settings.WorkMode", refused);
+      }
+
+      assert.deepEqual(control.writes, [
+        { address: 47000, value: 3 },
+        { address: 47000, value: 0 },
+      ]);
+    });
+
+    it("validates eco mode fields strictly", () => {
+      const field = (name: string): RegisterEntry =>
+        writableEntries.get(`Settings.EcoMode.Group1.${name}`) as RegisterEntry;
+
+      assert.equal(clampWriteValue(field("StartHour"), 23), 23);
+      assert.equal(clampWriteValue(field("StartHour"), "5"), 5);
+      assert.equal(clampWriteValue(field("StartHour"), 24), null);
+      assert.equal(clampWriteValue(field("StartHour"), 0.5), null);
+      assert.equal(clampWriteValue(field("StartMinute"), 59), 59);
+      assert.equal(clampWriteValue(field("StartMinute"), 60), null);
+      assert.equal(clampWriteValue(field("Power"), -100), -100);
+      assert.equal(clampWriteValue(field("Power"), 100), 100);
+      assert.equal(clampWriteValue(field("Power"), "-30"), -30);
+      assert.equal(clampWriteValue(field("Power"), -100.5), null);
+      assert.equal(clampWriteValue(field("Days"), 127), 127);
+      assert.equal(clampWriteValue(field("Days"), 255), null);
+      assert.equal(clampWriteValue(field("Enabled"), true), 1);
+      assert.equal(clampWriteValue(field("Enabled"), false), 0);
+      assert.equal(clampWriteValue(field("Enabled"), 255), null);
+      // A boolean is no hour.
+      assert.equal(clampWriteValue(field("StartHour"), true), null);
+    });
   });
 });
 
@@ -3669,4 +3953,226 @@ class ScriptedSocket extends EventEmitter {
   }
 
   close(): void {}
+}
+
+describe("eco mode encoding", () => {
+  it("decodes and encodes a group like marcelblijleven/goodwe", () => {
+    const slot = decodeEcoSlot(Buffer.from("0100053bffceff7f", "hex"));
+
+    assert.deepEqual(slot, {
+      startHour: 1,
+      startMinute: 0,
+      endHour: 5,
+      endMinute: 59,
+      power: -50,
+      onOff: 0xff,
+      days: 0x7f,
+    });
+    assert.deepEqual(encodeEcoSlot(slot), [0x0100, 0x053b, 0xffce, 0xff7f]);
+    assert.equal(validateEcoSlot(slot), null);
+    assert.equal(describeEcoSlot(slot), "01:00-05:59, Mon-Sun, -50 %, on");
+  });
+
+  it("reads the unused group marcelblijleven/goodwe writes as off", () => {
+    const slot = decodeEcoSlot(Buffer.from("3000300000640000", "hex"));
+
+    assert.equal(slot.startHour, 48);
+    assert.equal(slot.power, 100);
+    assert.equal(validateEcoSlot(slot), null);
+    assert.equal(describeEcoSlot(slot), "no time set, no days, 100 %, off");
+    // Switching it on needs real times first.
+    assert.notEqual(validateEcoSlot(withEcoField(slot, "Enabled", 1)), null);
+  });
+
+  it("refuses groups outside the documented ranges", () => {
+    const base = decodeEcoSlot(Buffer.from("0100053bffceff7f", "hex"));
+
+    assert.notEqual(validateEcoSlot({ ...base, startHour: 24 }), null);
+    assert.notEqual(validateEcoSlot({ ...base, endHour: 48 }), null);
+    assert.notEqual(validateEcoSlot({ ...base, startMinute: 60 }), null);
+    assert.notEqual(validateEcoSlot({ ...base, power: 101 }), null);
+    assert.notEqual(validateEcoSlot({ ...base, power: -101 }), null);
+    assert.notEqual(validateEcoSlot({ ...base, days: 128 }), null);
+    assert.equal(validateEcoSlot({ ...base, power: 0 }), null);
+  });
+
+  it("names the weekdays of the bit mask, Sunday first", () => {
+    assert.equal(decodeEcoDays(0), "");
+    assert.equal(decodeEcoDays(0b0000001), "Sun");
+    assert.equal(decodeEcoDays(0b0111110), "Mon,Tue,Wed,Thu,Fri");
+    assert.equal(decodeEcoDays(0x7f), "Mon-Sun");
+    assert.equal(decodeEcoDays(0xff), "Mon-Sun");
+  });
+
+  it("parses the eco mode settings group into states", async () => {
+    const group = registerGroups.settingsEcoMode;
+
+    assert.equal(group.start, 47515);
+    assert.equal(group.count, 16);
+    assert.equal(optionalGroupConfigs.settingsEcoMode, "pollSettings");
+
+    const socket = new FakeSocket(() =>
+      buildRegisterResponse(group, (response) => {
+        Buffer.from("0100053bffceff7f", "hex").copy(response, 5);
+        Buffer.from("3000300000640000", "hex").copy(response, 13);
+        Buffer.from("1100143b001e5502", "hex").copy(response, 21);
+        Buffer.from("3000300000640000", "hex").copy(response, 29);
+      }),
+    );
+    const inverter = createInverter(socket);
+
+    assert.equal(await inverter.ReadGroup("settingsEcoMode"), true);
+
+    const eco = inverter.Settings.EcoMode as Record<
+      string,
+      Record<string, number>
+    >;
+
+    assert.deepEqual(eco.Group1, {
+      StartHour: 1,
+      StartMinute: 0,
+      EndHour: 5,
+      EndMinute: 59,
+      Power: -50,
+      Enabled: 1,
+      Days: 127,
+    });
+    assert.equal(eco.Group2.StartHour, 48);
+    assert.equal(eco.Group2.Enabled, 0);
+    // Any on/off value but 0 counts as on, as in marcelblijleven/goodwe.
+    assert.equal(eco.Group3.Enabled, 1);
+    assert.equal(eco.Group3.Power, 30);
+    assert.equal(eco.Group3.Days, 2);
+  });
+
+  it("writes a summary state per group", async () => {
+    const writes: StateWrite[] = [];
+    const manager = new GoodWeStateManager(
+      {
+        config: testConfig,
+        log: testLogger,
+        setStateChangedAsync: (
+          id: string,
+          value: ioBroker.StateValue,
+          ack: boolean,
+        ) => {
+          writes.push({ id, value, ack });
+          return Promise.resolve(undefined);
+        },
+      } as unknown as StateAdapterLike,
+      {
+        Settings: {
+          EcoMode: {
+            Group1: {
+              StartHour: 1,
+              StartMinute: 0,
+              EndHour: 5,
+              EndMinute: 59,
+              Power: -50,
+              Enabled: 1,
+              Days: 127,
+            },
+          },
+        },
+      } as unknown as GoodWeUdp,
+    );
+
+    await manager.UpdateStatesFromRegisterMap(registerGroups.settingsEcoMode);
+
+    assert.deepEqual(
+      writes.find((entry) => entry.id === "Settings.EcoMode.Group1.Summary"),
+      {
+        id: "Settings.EcoMode.Group1.Summary",
+        value: "01:00-05:59, Mon-Sun, -50 %, on",
+        ack: true,
+      },
+    );
+    // Groups not read yet get no summary.
+    assert.equal(
+      writes.some((entry) => entry.id === "Settings.EcoMode.Group2.Summary"),
+      false,
+    );
+  });
+
+  it("sends one multiple register write with the frame marcelblijleven/goodwe builds", async () => {
+    const requests: Buffer[] = [];
+    const socket = new RecordingSocket(requests, () =>
+      buildWriteMultiResponse(47515, 4),
+    );
+    const inverter = createInverter(socket);
+
+    assert.equal(
+      await inverter.WriteRegisters(47515, [0x0100, 0x053b, 0xffce, 0xff7f]),
+      true,
+    );
+    // create_modbus_rtu_multi_request(0xF7, 0x10, 47515, 0100053bffceff7f)
+    assert.equal(
+      requests[0].toString("hex"),
+      "f710b99b0004080100053bffceff7f3039",
+    );
+  });
+
+  it("refuses a multiple write answer for another register range", async function () {
+    this.timeout(10000);
+
+    const sockets: ScriptedSocket[] = [];
+    const inverter = createInverterWithSockets(() => {
+      const socket = new ScriptedSocket(
+        sockets.length === 0
+          ? [buildIdInfoResponse(), buildWriteMultiResponse(47519, 4)]
+          : [null],
+      );
+
+      sockets.push(socket);
+
+      return socket;
+    });
+
+    assert.equal(
+      await inverter.Connect("192.168.178.42", 8899, {
+        timeoutMs: 1000,
+        retries: 0,
+      }),
+      true,
+    );
+    assert.equal(await inverter.WriteRegisters(47515, [0, 0, 0, 0]), false);
+  });
+
+  it("never sends register values outside 16 bits", async () => {
+    const requests: Buffer[] = [];
+    const socket = new RecordingSocket(requests, () =>
+      buildWriteMultiResponse(47515, 1),
+    );
+    const inverter = createInverter(socket);
+
+    assert.equal(await inverter.WriteRegisters(47515, [-50]), false);
+    assert.equal(await inverter.WriteRegisters(47515, [0x10000]), false);
+    assert.equal(await inverter.WriteRegisters(47515, []), false);
+    assert.deepEqual(requests, []);
+  });
+
+  it("reads raw registers and keeps the connection on a rejection", async () => {
+    const socket = new FakeSocket(() => buildExceptionResponse(0x03, 0x02));
+    const inverter = createInverter(socket);
+
+    assert.equal(await inverter.ReadRegisters(47547, 6), null);
+  });
+});
+
+function buildWriteMultiResponse(start: number, count: number): Buffer {
+  const response = Buffer.alloc(10);
+
+  response[0] = 0xaa;
+  response[1] = 0x55;
+  response[2] = 0xf7;
+  response[3] = 0x10;
+  response.writeUInt16BE(start, 4);
+  response.writeUInt16BE(count, 6);
+
+  const crc = calculateCrc16(response, 2, 6);
+
+  response[8] = crc >> 8;
+  response[9] = crc & 0xff;
+
+  return response;
 }

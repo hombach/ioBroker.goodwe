@@ -7,11 +7,22 @@ import {
   writableEntries,
 } from "./register-map";
 import type { RegisterEntry } from "./register-map";
+import {
+  decodeEcoSlot,
+  describeEcoSlot,
+  ECO_MODE_GROUP_REGISTERS,
+  ECO_MODE_V2_PROBE,
+  encodeEcoSlot,
+  validateEcoSlot,
+  withEcoField,
+} from "./eco-mode";
 
 interface ControlInverter {
   Status: boolean;
   Closed: boolean;
   WriteRegister: (address: number, value: number) => Promise<boolean>;
+  WriteRegisters: (start: number, values: number[]) => Promise<boolean>;
+  ReadRegisters: (start: number, count: number) => Promise<Uint8Array | null>;
   ReadGroup: (
     groupName: string,
     options?: { optional?: boolean; backoff?: boolean },
@@ -137,6 +148,16 @@ function clampWriteValue(
       : null;
   }
 
+  // A clamped or rounded value would be a different setting here, for example
+  // hour 23 for a typed 25 in an eco mode time slot.
+  if (range.strict) {
+    return Number.isInteger(scaled) &&
+      scaled >= range.min &&
+      scaled <= range.max
+      ? scaled
+      : null;
+  }
+
   return Math.min(range.max, Math.max(range.min, register));
 }
 
@@ -243,6 +264,11 @@ async function sendControlWrite(
     return;
   }
 
+  if (entry.ecoSlot) {
+    await sendEcoSlotWrite(context, stateId, entry, entry.ecoSlot, value);
+    return;
+  }
+
   const shown = toStateValue(entry, value);
 
   if (value !== Math.round(toRegisterUnits(entry, Number(stateValue)))) {
@@ -293,6 +319,112 @@ async function sendControlWrite(
   // Without a read-back the state would stay unacknowledged forever, showing a
   // value nobody confirmed. Acknowledge what the inverter echoed; a failed
   // write keeps its warning and is corrected by the next poll of the group.
+  if (written) {
+    await context.states.Acknowledge(stateId, shown);
+  }
+}
+
+/**
+ * Writes one field of an eco mode time slot as part of its whole group.
+ *
+ * The group is read fresh from the inverter, the field replaced, the whole
+ * group checked and then sent in one multiple register write (0x10), the way
+ * marcelblijleven/goodwe writes it. A group that cannot be read, or that would
+ * be invalid after the change, is not written at all.
+ *
+ * @param context adapter, inverter and state manager
+ * @param stateId state id without the adapter namespace
+ * @param entry writable eco mode entry
+ * @param ecoSlot group start and field of the entry
+ * @param value register value, already range checked
+ */
+async function sendEcoSlotWrite(
+  context: ControlContext,
+  stateId: string,
+  entry: RegisterEntry,
+  ecoSlot: NonNullable<RegisterEntry["ecoSlot"]>,
+  value: number,
+): Promise<void> {
+  const { start, field } = ecoSlot;
+
+  // Firmware with EcoModeV2 (ARM 19 and newer) keeps its slots elsewhere;
+  // writing the old registers there would change something nobody looks at,
+  // or something else entirely. marcelblijleven/goodwe tells them apart the
+  // same way: EcoModeV1 firmware rejects this read.
+  if (
+    (await context.inverter.ReadRegisters(
+      ECO_MODE_V2_PROBE.start,
+      ECO_MODE_V2_PROBE.count,
+    )) !== null
+  ) {
+    context.adapter.log.warn(
+      `Ignoring write to ${stateId}: the inverter has the newer eco mode registers (47547 ff.), which this adapter does not write`,
+    );
+    await readBack(context, stateId);
+    return;
+  }
+
+  const bytes = await context.inverter.ReadRegisters(
+    start,
+    ECO_MODE_GROUP_REGISTERS,
+  );
+
+  if (context.inverter.Closed) {
+    return;
+  }
+
+  if (bytes === null) {
+    context.adapter.log.warn(
+      `Ignoring write to ${stateId}: could not read eco mode group ${start}, nothing written`,
+    );
+    await readBack(context, stateId);
+    return;
+  }
+
+  const current = decodeEcoSlot(bytes);
+  const next = withEcoField(current, field, value);
+  const problem = validateEcoSlot(next);
+
+  if (problem !== null) {
+    context.adapter.log.warn(
+      `Ignoring write to ${stateId}: ${problem} (group would be ${describeEcoSlot(next)})`,
+    );
+    await readBack(context, stateId);
+    return;
+  }
+
+  const registers = encodeEcoSlot(next);
+
+  if (
+    encodeEcoSlot(current).every((register, i) => register === registers[i])
+  ) {
+    context.adapter.log.debug(
+      `Skipping write to ${stateId}: inverter already holds ${describeEcoSlot(current)}`,
+    );
+    await readBack(context, stateId);
+    return;
+  }
+
+  const written = await context.inverter.WriteRegisters(start, registers);
+
+  if (context.inverter.Closed) {
+    return;
+  }
+
+  const shown = toStateValue(entry, value);
+
+  if (written) {
+    context.adapter.log.info(
+      `Wrote ${shown} to ${stateId} (eco mode group ${start}: ${describeEcoSlot(next)})`,
+    );
+  } else {
+    context.adapter.log.warn(`Inverter did not confirm write to ${stateId}`);
+  }
+
+  if (await readBack(context, stateId)) {
+    return;
+  }
+
   if (written) {
     await context.states.Acknowledge(stateId, shown);
   }
