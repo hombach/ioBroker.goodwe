@@ -66,6 +66,7 @@ Raw register values are kept as ioBroker states. Mode values are numeric states 
 | `Settings.GridExportEnabled`, `Settings.GridExportLimit` | Grid export limit switch and value |
 | `Settings.EmsMode`, `Settings.EmsPowerLimit` | EMS mode and the power the EMS mode works with |
 | `Settings.WorkMode` | Work mode set in the SolarGo app: 0 general, 1 off-grid, 2 backup, 3 eco, 4 peak shaving, 5 self-use. With inverter control, 0 and 3 can be written |
+| `Settings.EcoMode.Group1.*` to `Group4.*` | Eco mode time slots of firmware before ARM 19 (registers 47515-47530): `StartHour`, `StartMinute`, `EndHour`, `EndMinute`, `Power` (% of rated power, negative charges, positive discharges), `Enabled`, `Days` (bit 0 Sunday to bit 6 Saturday, 127 every day) and a readable `Summary`. Writable with inverter control |
 | `Settings.LoadControl.*` | Load control output (mode, switch, SOC) as plain numbers, because GoodWe does not document their meaning. Read only, needs ARM firmware 19 or newer |
 
 ## Configuration
@@ -76,7 +77,7 @@ Raw register values are kept as ioBroker states. Mode values are numeric states 
   Modbus TCP is **experimental**: it has not been confirmed on a real dongle 2.0 yet. If it does not work for you, please open an issue with a debug log.
 * `discoverySubnet`: Optional `/24` subnet for network discovery, for example `192.168.178.0/24`.
 * `pollCycle`: Seconds between two reads of the live data (`RunningData`, `ExtComData`, `BMSInfo`) and the battery, EMS and work mode settings, from 2 to 3600.
-  The other optional register groups, `Settings.LoadControl.*` included, do not follow this cycle: they share one slot that is served round robin about every 30 seconds, and `DeviceInfo` is read once per connection.
+  The other optional register groups, `Settings.EcoMode.*` and `Settings.LoadControl.*` included, do not follow this cycle: they share one slot that is served round robin about every 30 seconds, and `DeviceInfo` is read once per connection.
 * `timeoutMs`: Request timeout in milliseconds, from 1000 to 30000.
 * `retries`: Retry count per request, from 0 to 5.
 * `pollExtended`: Master switch for optional register groups. `DeviceInfo`, `RunningData`, `ExtComData` and `BMSInfo` are always read.
@@ -87,8 +88,8 @@ Raw register values are kept as ioBroker states. Mode values are numeric states 
 * `pollBmsDetail`: Enables BMS detail registers, if supported by the inverter.
 * `pollCeiAutoTest`: Enables CEI auto test registers.
 * `pollPowerLimit`: Enables power limit registers, if supported by the inverter.
-* `pollSettings`: Enables the battery, EMS, work mode and load control setting registers.
-* `enableControl`: Makes the EMS, grid export, work mode, depth of discharge, charge current and discharge current states writable, see below. Off by default.
+* `pollSettings`: Enables the battery, EMS, work mode, eco mode time slot and load control setting registers.
+* `enableControl`: Makes the EMS, grid export, work mode, depth of discharge, charge current, discharge current and eco mode time slot states writable, see below. Off by default.
 
 The basic settings page also provides discovery helpers:
 
@@ -98,8 +99,8 @@ The basic settings page also provides discovery helpers:
 
 ## Inverter control
 
-With `enableControl` switched on, nine states become writable and are sent to the inverter as
-single register writes. Every other state stays read-only.
+With `enableControl` switched on, the states below become writable. They are sent to the inverter as
+single register writes, except the eco mode time slots (see below). Every other state stays read-only.
 
 | State | Register | Range | Description |
 | --- | --- | --- | --- |
@@ -112,6 +113,11 @@ single register writes. Every other state stays read-only.
 | `Settings.Battery.ChargeCurrent` | 45353 | 0-100 A | Maximum battery charge current; the BMS may limit it further |
 | `Settings.Battery.DischargeCurrent` | 45355 | 0-100 A | Maximum battery discharge current; the BMS may limit it further. The inverter returns to its default after a reboot, so a script has to write the value again |
 | `Settings.WorkMode` | 47000 | 0, 3 | Work mode: 0 general, 3 eco |
+| `Settings.EcoMode.GroupN.StartHour`, `EndHour` | 47515 ff. | 0-23 | Start and end hour of time slot N (1-4) |
+| `Settings.EcoMode.GroupN.StartMinute`, `EndMinute` | 47515 ff. | 0-59 | Start and end minute |
+| `Settings.EcoMode.GroupN.Power` | 47515 ff. | -100 to 100 % | Power in % of the rated power: negative charges the battery (also from the grid), positive discharges it |
+| `Settings.EcoMode.GroupN.Enabled` | 47515 ff. | 0-1 | Switches the time slot on or off |
+| `Settings.EcoMode.GroupN.Days` | 47515 ff. | 0-127 | Weekdays as bit mask: 1 Sunday, 2 Monday, 4 Tuesday ... 64 Saturday, 127 every day |
 
 `GridExportLimit`, `EmsPowerLimit`, the depths of discharge, `ChargeCurrent` and `DischargeCurrent`
 clamp values outside their range. The inverter stores the depth of discharge as the remaining reserve, 100 minus the value
@@ -139,13 +145,33 @@ Before a write the adapter reads the register group and skips the write when the
 the value. A script that repeats the same setpoint every cycle therefore does not send a register write
 every time.
 
-Switching `enableControl` on keeps the battery, EMS and work mode setting registers polled even when
+Switching `enableControl` on keeps the battery, EMS, work mode and eco mode setting registers polled even when
 `pollSettings` or `pollExtended` is off, because the writable states have to exist and be read back. Unlike the other
 optional groups, a failed read of this group does not pause it for an hour; it is tried again in the
 next poll cycle.
 
 The battery, EMS and work mode settings are read on every poll cycle, so a change made elsewhere, for example in the GoodWe app,
 shows up in the states within one `pollCycle`.
+
+### Eco mode time slots
+
+The eco mode time slots (EcoModeV1, firmware before ARM 19) are four groups of four registers at 47515,
+47519, 47523 and 47527, the layout [marcelblijleven/goodwe](https://github.com/marcelblijleven/goodwe)
+uses. The time slots only take effect while `Settings.WorkMode` is 3 (eco). A write to one field reads
+the whole group from the inverter, replaces the field, checks the whole group and sends all four
+registers in one multiple register write (function code 0x10), so the inverter never holds a half
+changed slot. The fields are not clamped: an hour outside 0-23, a minute outside 0-59, a power outside
+-100 to 100 %, days outside 0-127 or a fraction is refused. An unused slot reads hour 48 ("no time set");
+its fields can be filled in one by one while it is off, but it can only be switched on once start and
+end time are set. Inverters with the newer EcoModeV2 registers (47547 ff., ARM 19 and newer) are
+detected the way marcelblijleven/goodwe does it, by reading 47547: if the inverter answers, eco mode
+writes are refused, because those inverters use the newer registers.
+
+As described above for `WorkMode`, keep `Settings.EmsMode` at 1 (auto) while using the time slots.
+
+To change a slot that is on without the inverter acting on half the new values, switch it off
+(`Enabled` = 0), change the fields and switch it on again. Each write is one consistent group write,
+but a script setting several fields sends several of them.
 
 GoodWe does not document its writable registers. Control is off by default, and switching it on
 happens at your own risk: a wrong value changes inverter settings that the adapter cannot restore.
@@ -189,6 +215,8 @@ Recurring `retry` messages on debug level mean single UDP answers are getting lo
 - The battery discharge current (`Settings.Battery.DischargeCurrent`, up to 100 A) can be written when inverter control is on. The inverter returns to its default after a reboot, so a script can now restore a lower limit, for example for older batteries (#60).
 - The work mode (`Settings.WorkMode`) can be written when inverter control is on, limited to general (0) and eco (3). Off-grid, backup, peak shaving and self-use are refused. Only the work mode register is written: a script that has set a manual EMS mode sets `EmsMode` back to auto (1) first (#61).
 - The work mode is now read on every poll cycle together with the battery and EMS settings, instead of in the slot of the optional groups. With inverter control on, it is read even when `pollSettings` or `pollExtended` is off, which adds one request per poll cycle.
+- Added the eco mode time slots of firmware before ARM 19 (registers 47515-47530, EcoModeV1) as `Settings.EcoMode.Group1.*` to `Group4.*` with start and end time, power, on/off, weekdays and a readable summary, read with `pollSettings` (#61).
+- With inverter control on, the eco mode time slots can be written. A field write reads the whole slot, checks it and writes all four registers in one multiple register write (0x10); out of range values are refused, not clamped. Inverters with the newer EcoModeV2 registers are detected and not written (#61).
 
 ### 1.3.0 (2026-10-27)
 - Added Modbus TCP on port 502 as a second, experimental connection for the GoodWe WiFi/LAN dongle 2.0, which does not answer the UDP protocol on port 8899 when it is connected by LAN. Choose it under "Connection" in the basic settings; UDP stays the default. The inverter search uses the selected connection (#59).
