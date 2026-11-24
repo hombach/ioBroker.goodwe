@@ -19,6 +19,7 @@ class GoodWeRegister {
     static FcCode = {
         Read: 0x03,
         WriteSingleRegister: 0x06,
+        WriteMultipleRegisters: 0x10,
     };
     // Header, address, function code, register address and value, without CRC.
     static WriteResponse = { Length: 10 };
@@ -539,6 +540,85 @@ class GoodWeUdp {
         }
     }
     /**
+     * Reads a block of registers and returns its raw payload, or null.
+     *
+     * For the control path, which needs the register bytes rather than parsed
+     * states. Like an optional group read, a lost or rejected answer neither
+     * takes the connection offline nor is logged above debug level.
+     *
+     * @param start first register
+     * @param count number of registers, 1 to 125
+     */
+    async ReadRegisters(start, count) {
+        if (!Number.isInteger(count) || count < 1 || count > 125) {
+            return null;
+        }
+        const sendbuf = this.#buildReadRegisterRequest(start, count);
+        const previousStatus = this.#status;
+        try {
+            const rcvbuf = await this.#request(sendbuf, (data) => this.#CheckRecRegisterData(data, sendbuf[1], count), `ReadRegisters ${start}`, (data) => this.#ExceptionCode(data, sendbuf[1]));
+            return Uint8Array.from(rcvbuf.subarray(5, 5 + count * 2));
+        }
+        catch (error) {
+            if (!this.#closed) {
+                this.#status = previousStatus;
+                this.log.debug?.(`ReadRegisters ${start}: ${(0, errors_1.errorMessage)(error)}`);
+            }
+            return null;
+        }
+    }
+    #buildWriteRegistersRequest(start, values) {
+        // Address, function code, start, register count, byte count, data, CRC -
+        // the Modbus RTU frame marcelblijleven/goodwe sends for write_multi.
+        const sendbuf = new Uint8Array(7 + values.length * 2 + 2);
+        sendbuf[0] = GoodWeRegister.Addr.Inverter;
+        sendbuf[1] = GoodWeRegister.FcCode.WriteMultipleRegisters;
+        sendbuf[2] = start >> 8;
+        sendbuf[3] = start & 0x00ff;
+        sendbuf[4] = values.length >> 8;
+        sendbuf[5] = values.length & 0x00ff;
+        sendbuf[6] = values.length * 2;
+        values.forEach((value, index) => {
+            sendbuf[7 + index * 2] = value >> 8;
+            sendbuf[8 + index * 2] = value & 0x00ff;
+        });
+        const crcStart = sendbuf.length - 2;
+        const crc = (0, modbus_tcp_1.crc16)(sendbuf, 0, crcStart);
+        sendbuf[crcStart] = crc >> 8;
+        sendbuf[crcStart + 1] = crc & 0x00ff;
+        return sendbuf;
+    }
+    /**
+     * Writes consecutive holding registers in one request (function code 0x10)
+     * and waits for the inverter to confirm start and count.
+     *
+     * One request, so the inverter never holds a half written group - for
+     * example an eco mode time slot with the new power but the old times.
+     *
+     * @param start first register
+     * @param values unsigned 16 bit register values, already checked by the
+     *   caller; at most 16 registers
+     */
+    async WriteRegisters(start, values) {
+        if (values.length < 1 ||
+            values.length > 16 ||
+            !values.every((value) => Number.isInteger(value) && value >= 0 && value <= 0xffff)) {
+            this.log.warn(`WriteRegisters ${start}: refused invalid register values`);
+            return false;
+        }
+        const sendbuf = this.#buildWriteRegistersRequest(start, values);
+        try {
+            await this.#request(sendbuf, (data) => this.#CheckRecWriteMultiData(data, start, values.length), `WriteRegisters ${start}`, (data) => this.#ExceptionCode(data, sendbuf[1]));
+            return true;
+        }
+        catch (error) {
+            if (!this.#closed) {
+                this.log.warn(`WriteRegisters ${start}: ${(0, errors_1.errorMessage)(error)}`);
+            }
+            return false;
+        }
+    }
+    /**
      * Asks the inverter for its ID info and uses the answer as a liveness check.
      *
      * The parsed fields are not surfaced as states, so the frame is only built
@@ -620,6 +700,23 @@ class GoodWeUdp {
             Data[5] === (address & 0x00ff) &&
             Data[6] === value >> 8 &&
             Data[7] === (value & 0x00ff) &&
+            Data[8] === crc >> 8 &&
+            Data[9] === (crc & 0x00ff));
+    }
+    // The answer to a multiple register write echoes start and register count.
+    #CheckRecWriteMultiData(Data, start, count) {
+        if (Data.length < GoodWeRegister.WriteResponse.Length) {
+            return false;
+        }
+        const crc = (0, modbus_tcp_1.crc16)(Data, 2, GoodWeRegister.WriteResponse.Length - GoodWeRegister.Format.CRC16 - 2);
+        return (Data[0] === GoodWeRegister.RecvHeader.High &&
+            Data[1] === GoodWeRegister.RecvHeader.Low &&
+            Data[2] === GoodWeRegister.Addr.Inverter &&
+            Data[3] === GoodWeRegister.FcCode.WriteMultipleRegisters &&
+            Data[4] === start >> 8 &&
+            Data[5] === (start & 0x00ff) &&
+            Data[6] === count >> 8 &&
+            Data[7] === (count & 0x00ff) &&
             Data[8] === crc >> 8 &&
             Data[9] === (crc & 0x00ff));
     }
